@@ -33,6 +33,9 @@ Set your API key as an environment variable:
 
 ```bash
 export COPILOT_KEY="your-api-key-here"
+export API_ENDPOINT="xxx"
+export API_KEY="your-api-key-here"
+export ASSISTANT_ID="your-assistant-id-here"
 
 # Add to your shell profile for persistence
 echo 'export COPILOT_KEY="your-api-key-here"' >> ~/.bashrc
