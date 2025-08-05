@@ -625,6 +625,8 @@ main() {
    
     if [[ -z "$ASSISTANT_ID" ]]; then
         log_error "Assistant ID is required. Set ASSISTANT_ID environment variable."
+        exit 1
+    fi
     
     # Initialize session log
     mkdir -p "$(dirname "$SESSION_LOG")"
