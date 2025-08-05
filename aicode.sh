@@ -73,7 +73,9 @@ CONFIGURATION:
     API key can be set via COPILOT_KEY environment variable (recommended)
     
     Example:
-        export COPILOT_KEY="your-api-key-here"
+        export API_ENDPOINT="xxx"
++       export API_KEY="your-api-key-here"
++       export ASSISTANT_ID="your-assistant-id-here"
         ./aicode.sh create "A Python web scraper"
 EOF
 }
@@ -106,76 +108,26 @@ log_action() {
     echo "$(date '+%Y-%m-%d %H:%M:%S') [ACTION] $1" >> "$SESSION_LOG" 2>/dev/null || true
 }
 
-# Load configuration
-load_config() {
-    local config_file="${1:-$CONFIG_FILE}"
-    
-    if [[ -f "$config_file" ]]; then
-        log_info "Loading configuration from $config_file"
-        # shellcheck source=/dev/null
-        source "$config_file"
-    fi
-    
-    # Use COPILOT_KEY environment variable if available
-    if [[ -n "${COPILOT_KEY:-}" ]]; then
-        API_KEY="$COPILOT_KEY"
-        log_info "Using API key from COPILOT_KEY environment variable"
-    fi
-}
-
 # Interactive setup
 setup_config() {
     echo "Setting up AI Code Assistant configuration..."
+    echo "Note: Set API_ENDPOINT, API_KEY, and ASSISTANT_ID as environment variables."
     echo
     
-    read -p "API Endpoint URL: " -r api_endpoint
-    
-    # Check if COPILOT_KEY is already set
-    if [[ -n "${COPILOT_KEY:-}" ]]; then
-        echo "Using existing COPILOT_KEY environment variable for API key."
-        api_key="$COPILOT_KEY"
-    else
-        read -p "API Key or set COPILOT_KEY environment variable: " -rs api_key
-        echo
-        echo "Note: You can also set the COPILOT_KEY environment variable instead of storing in config."
-    fi
-    
-    read -p "Default Model [$DEFAULT_MODEL]: " -r model
-    read -p "Default Temperature [$DEFAULT_TEMPERATURE]: " -r temperature
-    read -p "Default Max Tokens [$DEFAULT_MAX_TOKENS]: " -r max_tokens
-    
-    model=${model:-$DEFAULT_MODEL}
-    temperature=${temperature:-$DEFAULT_TEMPERATURE}
-    max_tokens=${max_tokens:-$DEFAULT_MAX_TOKENS}
-    
-    # Write configuration
-    cat > "$CONFIG_FILE" << EOF
-# AI Code Assistant Configuration
-API_ENDPOINT="$api_endpoint"
-$(if [[ "$api_key" != "${COPILOT_KEY:-}" ]]; then echo "API_KEY=\"$api_key\""; else echo "# API_KEY is using COPILOT_KEY environment variable"; fi)
-DEFAULT_MODEL="$model"
-DEFAULT_TEMPERATURE="$temperature"
-DEFAULT_MAX_TOKENS="$max_tokens"
-EOF
-    
-    chmod 600 "$CONFIG_FILE"
-    log_success "Configuration saved to $CONFIG_FILE"
+    echo "Example:"
+    echo "export API_ENDPOINT='https://xxx'"
+    echo "export API_KEY='your-api-key-here'"
+    echo "export ASSISTANT_ID='your-assistant-id-here'"
+    echo
+    echo "Then run the script normally."
+
     exit 0
 }
 
 # Check dependencies
 check_dependencies() {
-    local deps=("curl")
-    local missing=()
-    
-    for dep in "${deps[@]}"; do
-        if ! command -v "$dep" >/dev/null 2>&1; then
-            missing+=("$dep")
-        fi
-    done
-    
-    if [[ ${#missing[@]} -gt 0 ]]; then
-        log_error "Missing required dependencies: ${missing[*]}"
+    if ! command -v "curl" >/dev/null 2>&1; then
+        log_error "Missing required dependency: curl"
         exit 1
     fi
 }
@@ -200,27 +152,27 @@ create_json_payload() {
     local temperature="$4"
     local max_tokens="$5"
     
-    # Escape JSON strings
-    system_prompt=$(json_escape "$system_prompt")
-    user_prompt=$(json_escape "$user_prompt")
-    model=$(json_escape "$model")
-    
-    # LLM Forge requires specific format: role must be "user" or "bot", and needs "id" field
-    # Combine system and user prompts since we can't use "system" role
+    # Combine system and user prompts
     local combined_prompt="$system_prompt\n\n$user_prompt"
     combined_prompt=$(json_escape "$combined_prompt")
+
+    # Generate unique IDs
+    local message_id="$(date +%s)-$(shuf -i 1000-9999 -n 1)"
+    local conversation_id="$(uuidgen 2>/dev/null || echo "$(date +%s)-$(shuf -i 10000-99999 -n 1)")"
+    local trace_id="$(uuidgen 2>/dev/null || echo "$(date +%s)-$(shuf -i 10000-99999 -n 1)")"
     
     cat << EOF
 {
     "messages": [
         {
             "role": "user",
-            "content": "$combined_prompt",
-            "id": "$(date +%s)"
+            "id": "$message_id",
+            "content": "$combined_prompt"
         }
     ],
-    "temperature": $temperature,
-    "max_tokens": $max_tokens
+    "conversationId": "$conversation_id",
+    "traceId": "$trace_id",
+    "stream": false
 }
 EOF
 }
@@ -364,17 +316,24 @@ create_ai_prompt() {
 
 # Make API request
 make_ai_request() {
-    local endpoint="$1"
-    local api_key="$2"
-    local payload="$3"
+    local api_key="$1"
+    local payload="$2"
+    
+    # Construct endpoint URL with ASSISTANT_ID
+    local endpoint="${API_ENDPOINT}/assistants/${ASSISTANT_ID}/completions"
+    
+    # Remove trailing slash from API_ENDPOINT if present
+    endpoint="${endpoint//\/\/assistants/\/assistants}"
     
     log_info "Making request to: $endpoint"
     log_info "Payload: $payload"
     
     local response
     response=$(curl -s -w "\n%{http_code}" \
-        -H "Content-Type: application/json" \
+        -X 'POST' \
+        -H 'accept: application/json' \
         -H "Authorization: Bearer $api_key" \
+        -H "Content-Type: application/json" \
         -d "$payload" \
         "$endpoint")
     
@@ -387,12 +346,13 @@ make_ai_request() {
     log_info "Response body: $body"
     
     if [[ "$http_code" -ge 200 && "$http_code" -lt 300 ]]; then
+        # Extract response content - try multiple possible field names
         local content
-        content=$(extract_json_field "$body" "choices[0].message.content")
-        if [[ $? -eq 0 && -n "$content" ]]; then
-            echo "$content"
+        content=$(echo "$body" | sed -n 's/.*"content"[[:space:]]*:[[:space:]]*"\(.*\)".*/\1/p' | tail -1)
+        if [[ -n "$content" ]]; then
+            echo "$content" | sed 's/\\n/\n/g; s/\\"/"/g; s/\\\\/\\/g'
         else
-            # Try alternative extraction for different API formats
+            # Try alternative response field
             local alt_content
             alt_content=$(echo "$body" | sed -n 's/.*"response"[[:space:]]*:[[:space:]]*"\(.*\)".*/\1/p' | head -1)
             if [[ -n "$alt_content" ]]; then
@@ -406,15 +366,9 @@ make_ai_request() {
         log_error "HTTP $http_code: API request failed"
         echo "Full response: $body" >&2
         
-        # Try to extract various error message formats
+        # Try to extract error message
         local error_msg
-        error_msg=$(extract_json_field "$body" "error.message" 2>/dev/null)
-        if [[ $? -ne 0 || -z "$error_msg" ]]; then
-            error_msg=$(echo "$body" | sed -n 's/.*"error"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -1)
-        fi
-        if [[ $? -ne 0 || -z "$error_msg" ]]; then
-            error_msg=$(echo "$body" | sed -n 's/.*"message"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -1)
-        fi
+        error_msg=$(echo "$body" | sed -n 's/.*"message"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -1)
         
         if [[ -n "$error_msg" ]]; then
             echo "Error: $error_msg" >&2
@@ -515,11 +469,12 @@ execute_ai_command() {
     # Make AI request
     log_info "About to call make_ai_request with:"
     log_info "  Endpoint: '${API_ENDPOINT:-}'"
+    log_info "  Assistant ID: '${ASSISTANT_ID:-}'"
     log_info "  API Key: '${API_KEY:0:8}...${API_KEY: -8}'"
     log_info "  Payload length: ${#payload}"
     
     local ai_response
-    ai_response=$(make_ai_request "${API_ENDPOINT:-}" "${API_KEY:-}" "$payload")
+    ai_response=$(make_ai_request "${API_KEY:-}" "$payload")
     
     if [[ $? -eq 0 ]]; then
         # Process the response
@@ -644,29 +599,32 @@ main() {
     check_dependencies
     
     # Load configuration
-    load_config "$config_file"
+    #load_config "$config_file"
     
-    # Use command line arguments or config defaults or environment variables
+    # Use environment variables
     export API_ENDPOINT="${API_ENDPOINT:-}"
-    export API_KEY="${API_KEY:-${COPILOT_KEY:-}}"
+    export API_KEY="${API_KEY:-}"
+    export ASSISTANT_ID="${ASSISTANT_ID:-}"
     export MODEL="${MODEL:-${DEFAULT_MODEL:-$DEFAULT_MODEL}}"
     export TEMPERATURE="${TEMPERATURE:-${DEFAULT_TEMPERATURE:-$DEFAULT_TEMPERATURE}}"
     export MAX_TOKENS="${MAX_TOKENS:-${DEFAULT_MAX_TOKENS:-$DEFAULT_MAX_TOKENS}}"
     
     # Debug API key loading
-    log_info "Environment COPILOT_KEY: ${COPILOT_KEY:0:8}...${COPILOT_KEY: -8}"
     log_info "Final API_KEY: ${API_KEY:0:8}...${API_KEY: -8}"
     
     # Validate required parameters
     if [[ -z "$API_ENDPOINT" ]]; then
-        log_error "API endpoint is required. Use --endpoint or run --setup."
+        log_error "API endpoint is required. Set API_ENDPOINT environment variable."
         exit 1
     fi
     
     if [[ -z "$API_KEY" ]]; then
-        log_error "API key is required. Use --key, set COPILOT_KEY environment variable, or run --setup."
+        log_error "API key is required. Set API_KEY environment variable."
         exit 1
     fi
+   
+    if [[ -z "$ASSISTANT_ID" ]]; then
+        log_error "Assistant ID is required. Set ASSISTANT_ID environment variable."
     
     # Initialize session log
     mkdir -p "$(dirname "$SESSION_LOG")"
